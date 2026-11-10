@@ -52,7 +52,28 @@ param(
 $ErrorActionPreference = 'Stop'
 $curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 if (-not $curl) { throw 'curl.exe not found (Windows 10 1803+ ships it; otherwise install curl).' }
+
+# curl writes progress/failure text on stderr. With ErrorActionPreference=Stop a
+# perfectly expected failure (host down, 421, 550) would abort the script instead of
+# being handled, so every call goes through this wrapper: stderr is swallowed, the
+# exit code and stdout lines are kept.
+function Invoke-Curl {
+    param([string[]]$CurlArgs)
+    $eap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $raw = & $curl @CurlArgs 2>&1
+        $script:CurlExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $eap
+    }
+    return @($raw | Where-Object { $_ -is [string] })
+}
 if (-not $Server) { throw 'Missing -Server (or set env FTP_SERVER).' }
+# Bare host:port is what people actually type; curl would treat it as HTTP otherwise.
+if ($Server -notmatch '^[a-zA-Z][a-zA-Z0-9+.-]*://') {
+    $Server = 'ftp://' + $Server
+}
 if (-not $User) { throw 'Missing -User (or set env FTP_USER).' }
 $pass = $env:FTP_PASS
 if (-not $pass) { throw 'Set env FTP_PASS before running (keeps the secret out of files and history).' }
@@ -87,7 +108,7 @@ function Get-RemoteSize([string]$RemotePath) {
     # LIST one directory and pick the entry; avoids parsing whole-tree listings.
     $dir = ($RemotePath -replace '/[^/]*$', '')
     $name = ($RemotePath -split '/')[-1]
-    $listing = & $curl -sS --max-time 60 --user "${User}:${pass}" "$Server$dir/" 2>$null
+    $listing = Invoke-Curl -CurlArgs @('-sS', '--max-time', '60', '--user', "${User}:${pass}", "$Server$dir/")
     if (-not $listing) { return $null }
     foreach ($line in ($listing -split "`r?`n")) {
         $parts = $line -split '\s+'
@@ -98,7 +119,7 @@ function Get-RemoteSize([string]$RemotePath) {
 
 function Test-FtpSlot([string]$Target) {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $code = & $curl -sS --max-time 60 --user "${User}:${pass}" "$Target" -o NUL -w '%{http_code}' 2>$null
+    $code = Invoke-Curl -CurlArgs @('-sS', '--max-time', '60', '--user', "${User}:${pass}", "$Target", '-o', 'NUL', '-w', '%{http_code}')
     $sw.Stop()
     return [pscustomobject]@{ Code = ($code -join ''); Ms = [int]$sw.ElapsedMilliseconds }
 }
@@ -140,6 +161,7 @@ if ($DryRun) {
 
 # ---------------------------------------------------------------- upload
 $failed = @()
+$badChecks = @()
 for ($i = 0; $i -lt $Files.Count; $i++) {
     $local = $existing[$i]
     $remote = Join-Remote $Files[$i]
@@ -147,7 +169,7 @@ for ($i = 0; $i -lt $Files.Count; $i++) {
     $ok = $false
 
     for ($attempt = 1; $attempt -le $Retries -and -not $ok; $attempt++) {
-        $out = & $curl -sS --max-time 300 --user "${User}:${pass}" -T $local "$Server$remote" -w '%{http_code} %{size_upload}' 2>&1
+        $out = Invoke-Curl -CurlArgs @('-sS', '--max-time', '300', '--user', "${User}:${pass}", '-T', $local, "$Server$remote", '-w', '%{http_code} %{size_upload}')
         $outText = ($out -join ' ')
         $code = ($outText -split ' ')[0]
         Write-Log ("upload {0} attempt {1}: {2}" -f $remote, $attempt, $outText)
@@ -174,18 +196,24 @@ for ($i = 0; $i -lt $Files.Count; $i++) {
 # ---------------------------------------------------------------- delete
 foreach ($d in $Delete) {
     $remote = Join-Remote $d
-    $code = & $curl -sS --max-time 60 --user "${User}:${pass}" $Server -Q "DELE $remote" -o NUL -w '%{http_code}' 2>$null
+    $code = Invoke-Curl -CurlArgs @('-sS', '--max-time', '60', '--user', "${User}:${pass}", $Server, '-Q', "DELE $remote", '-o', 'NUL', '-w', '%{http_code}')
     Write-Log ("delete {0}: {1}" -f $remote, ($code -join ''))
 }
 
 # ---------------------------------------------------------------- http check
 foreach ($u in $Check) {
-    $code = & $curl -sS -o NUL -w '%{http_code}' --max-time 30 $u 2>$null
-    Write-Log ("check {0}: {1}" -f $u, ($code -join ''))
+    $code = (Invoke-Curl -CurlArgs @('-sS', '-o', 'NUL', '-w', '%{http_code}', '--max-time', '30', $u)) -join ''
+    Write-Log ("check {0}: {1}" -f $u, $code)
+    if ($code -notmatch '^[23][0-9][0-9]$') { $badChecks += $u }
 }
 
-if ($failed.Count -gt 0) {
-    Write-Log ("FAILED: {0} file(s) - {1}" -f $failed.Count, ($failed -join ', ')) 'ERROR'
+if ($failed.Count -gt 0 -or $badChecks.Count -gt 0) {
+    if ($failed.Count -gt 0) {
+        Write-Log ("FAILED: {0} file(s) - {1}" -f $failed.Count, ($failed -join ', ')) 'ERROR'
+    }
+    if ($badChecks.Count -gt 0) {
+        Write-Log ("FAILED: {0} URL check(s) - {1}" -f $badChecks.Count, ($badChecks -join ', ')) 'ERROR'
+    }
     exit 4
 }
 Write-Log 'all files uploaded and verified'

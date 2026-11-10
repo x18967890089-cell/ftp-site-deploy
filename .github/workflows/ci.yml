@@ -111,6 +111,54 @@ jobs:
             Write-Host 'log has no "verified" line'; exit 1
           }
 
+      # 新增：裸 host:port 也要能用（curl 否则会当成 HTTP，报 "Received HTTP/0.9"）
+      - name: Bare host:port is accepted (no ftp:// prefix)
+        shell: powershell
+        run: |
+          $env:FTP_PASS = 'cipass'
+          & powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1 `
+            -LocalRoot D:\ci-site `
+            -Files public/index.php `
+            -Server '127.0.0.1:2121' -User ci -RemoteRoot / `
+            -LogPath D:\ci-bare.log
+          $rc = $LASTEXITCODE
+          Get-Content D:\ci-bare.log
+          if ($rc -ne 0) { Write-Host "bare-server deploy exited $rc"; exit 1 }
+          if (-not (Select-String -Path D:\ci-bare.log -Pattern 'perflight|preflight' -Quiet)) { Write-Host 'no preflight line'; exit 1 }
+          exit 0
+
+      # 新增：-Check 拿不到 2xx/3xx 时必须让整个运行失败（不再是「只打一行日志」）
+      - name: Failing -Check URL must exit 4
+        shell: powershell
+        run: |
+          $env:FTP_PASS = 'cipass'
+          & powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1 `
+            -LocalRoot D:\ci-site `
+            -Files public/index.php `
+            -Server ftp://127.0.0.1:2121 -User ci -RemoteRoot / `
+            -Check 'http://127.0.0.1:2121/definitely-not-ok' `
+            -LogPath D:\ci-check.log
+          $rc = $LASTEXITCODE
+          Get-Content D:\ci-check.log
+          if ($rc -ne 4) { Write-Host "expected exit 4 for a failing -Check, got $rc"; exit 1 }
+          if (-not (Select-String -Path D:\ci-check.log -Pattern 'URL check' -Quiet)) { Write-Host 'no URL check failure line'; exit 1 }
+          exit 0
+
+      # 新增：FTP 主机不可达要走 preflight 的 exit 2，而不是抛 PowerShell 红字
+      - name: Unreachable host must exit 2, not throw
+        shell: powershell
+        run: |
+          $env:FTP_PASS = 'cipass'
+          & powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1 `
+            -LocalRoot D:\ci-site `
+            -Files public/index.php `
+            -Server '127.0.0.1:9' -User ci -RemoteRoot / `
+            -LogPath D:\ci-unreachable.log
+          $rc = $LASTEXITCODE
+          Get-Content D:\ci-unreachable.log
+          if ($rc -ne 2) { Write-Host "expected exit 2 for unreachable host, got $rc"; exit 1 }
+          if (-not (Select-String -Path D:\ci-unreachable.log -Pattern 'connection slot not usable' -Quiet)) { Write-Host 'no preflight error line'; exit 1 }
+          exit 0
       - name: Second run must be idempotent
         shell: powershell
         run: |
