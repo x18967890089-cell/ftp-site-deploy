@@ -143,6 +143,7 @@ jobs:
           Get-Content D:\ci-dry.log
           if (-not (Select-String -Path D:\ci-dry.log -Pattern 'would upload' -Quiet)) { exit 1 }
           Write-Host 'dry run ok'
+          exit 0
 
       - name: Missing local file must exit 3
         shell: powershell
@@ -155,6 +156,8 @@ jobs:
           Get-Content D:\ci-missing.log
           if ($rc -ne 3) { Write-Host "expected exit 3, got $rc"; exit 1 }
           Write-Host 'missing-file exit code ok'
+          # a non-zero $LASTEXITCODE would otherwise become this step's exit code
+          exit 0
 
       - name: Stop the FTP server
         if: always()
