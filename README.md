@@ -35,7 +35,7 @@ Two jobs run on `windows-latest` for every push:
 | Job | What actually happens |
 | --- | --- |
 | `static` | The script is parsed by Windows PowerShell 5.1's own parser (0 errors), every byte is checked to be ASCII (a non-ASCII byte is what breaks quoting when a no-BOM file is read as ANSI), and PSScriptAnalyzer runs with `-Severity Error`. |
-| `e2e` | A throwaway `pyftpdlib` server is started on port 2121, then the script really uploads two files: exit `0`, both remote byte counts match, the log contains `verified`, a second run is still idempotent, `-Delete` removes the target (`226`), `-DryRun` prints `would upload`, and a missing local file exits `3`. |
+| `e2e` | A throwaway `pyftpdlib` server is started on port 2121, then the script really uploads two files: exit `0`, both remote byte counts match, the log contains `verified`, a second run is still idempotent, `-Delete` removes the target (`226`), `-DryRun` prints `would upload`, a missing local file exits `3`, an unreachable host exits `2` (no PowerShell red text), a bare `host:port` server works, and a failing `-Check` URL exits `4`. |
 
 That is the whole point of the repository: the failure modes are the product, so they are
 reproduced in CI instead of described in prose.
@@ -73,7 +73,7 @@ $env:FTP_PASS = '***'
 | --- | --- | --- |
 | `-LocalRoot` | — | Local site root; all `-Files` paths are relative to it. |
 | `-Files` | — | Files to upload. Explicit list — never "the whole tree". |
-| `-Server` | `$env:FTP_SERVER` | `ftp://host:port` (add `ftps://` for implicit TLS if the host supports it). |
+| `-Server` | `$env:FTP_SERVER` | `ftp://host:port` (add `ftps://` for implicit TLS if the host supports it). A bare `host:port` is also accepted and gets `ftp://` prepended - otherwise curl treats it as HTTP and fails with `Received HTTP/0.9 when not allowed`. |
 | `-User` | `$env:FTP_USER` | FTP account. |
 | `-RemoteRoot` | `/` | Remote directory that maps to `-LocalRoot`. |
 | `-Delete` | empty | Remote files to delete, relative to `-RemoteRoot`. |
@@ -92,7 +92,17 @@ your working tree — a debug `config.php`, a `storage/` cache, a half-finished 
 Naming files keeps the blast radius equal to the change you actually tested, and it
 makes the remote size check meaningful.
 
-## Scope
+## Exit codes
+
+| code | meaning |
+|---|---|
+| `0` | every file uploaded, remote byte count matched, every `-Check` URL answered 2xx/3xx |
+| `1` | bad arguments / unexpected exception |
+| `2` | preflight failed - the FTP host did not answer `226` (often `421`, i.e. out of session slots) |
+| `3` | a path in `-Files` does not exist locally; nothing was touched on the server |
+| `4` | upload or verification failed, or a `-Check` URL did not answer 2xx/3xx |
+
+## Known limits
 
 This is a single-host, sequential, no-downtime-window deploy tool. It is not a
 release manager: no rollback, no atomic symlink switch, no concurrency. On a host
