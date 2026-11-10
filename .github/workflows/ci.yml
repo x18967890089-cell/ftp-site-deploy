@@ -1,0 +1,166 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    name: parse + ascii + PSScriptAnalyzer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax tree must have zero parse errors (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $errs = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD\deploy.ps1", [ref]$null, [ref]$errs)
+          if ($errs -and $errs.Count -gt 0) {
+            $errs | ForEach-Object { Write-Host "PARSE ERROR: $($_.Message) at line $($_.Extent.StartLineNumber)" }
+            exit 1
+          }
+          Write-Host "parse ok: 0 errors"
+
+      - name: File must stay pure ASCII
+        shell: powershell
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes("$PWD\deploy.ps1")
+          $bad = ($bytes | Where-Object { $_ -gt 127 }).Count
+          if ($bad -gt 0) {
+            Write-Host "non-ascii bytes: $bad"
+            Write-Host "No-BOM UTF-8 scripts are read as ANSI by Windows PowerShell 5.1; em dashes break quoting."
+            exit 1
+          }
+          Write-Host "ascii ok: 0 non-ascii bytes"
+
+      - name: PSScriptAnalyzer (errors only)
+        shell: powershell
+        run: |
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -AllowClobber
+          $issues = Invoke-ScriptAnalyzer -Path "$PWD\deploy.ps1" -Severity Error
+          if ($issues) { $issues | Format-Table -AutoSize | Out-String | Write-Host; exit 1 }
+          Write-Host "PSScriptAnalyzer: no errors"
+
+  e2e:
+    name: real FTP upload against pyftpdlib
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install a disposable FTP server
+        run: python -m pip install --quiet pyftpdlib
+
+      - name: Lay out a site and an FTP root
+        shell: powershell
+        run: |
+          $site = 'D:\ci-site'
+          New-Item -ItemType Directory -Force -Path "$site\public\js" | Out-Null
+          Set-Content -LiteralPath "$site\public\index.php" -Value '<?php echo "CI_OK";' -Encoding UTF8
+          Set-Content -LiteralPath "$site\public\js\app.js" -Value ('var ci = "' + ('x' * 2000) + '";') -Encoding UTF8
+          $root = 'D:\ftp-root'
+          New-Item -ItemType Directory -Force -Path "$root\public\js" | Out-Null
+          Set-Content -LiteralPath "$root\public\remove-me.txt" -Value 'stale' -Encoding UTF8
+          Get-ChildItem $site -Recurse -File | ForEach-Object { "{0} {1}" -f $_.Length, $_.FullName }
+
+      - name: Start pyftpdlib on 2121
+        shell: powershell
+        run: |
+          $args = @('-m', 'pyftpdlib', '-p', '2121', '-w', '-d', 'D:\ftp-root', '-u', 'ci', '-P', 'cipass')
+          $p = Start-Process python -ArgumentList $args -PassThru -WindowStyle Hidden
+          $p.Id | Out-File -Encoding ascii D:\ftp.pid
+          $ok = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Milliseconds 500
+            $code = & curl.exe -sS --max-time 5 --user 'ci:cipass' 'ftp://127.0.0.1:2121/' -o NUL -w '%{http_code}' 2>$null
+            if (($code -join '') -eq '226') { $ok = $true; break }
+          }
+          if (-not $ok) { Write-Host 'FTP server never answered 226'; exit 1 }
+          Write-Host 'ftp server ready (226)'
+
+      - name: Real deploy (expect 226 + byte-count verification)
+        shell: powershell
+        run: |
+          $env:FTP_PASS = 'cipass'
+          & powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1 `
+            -LocalRoot D:\ci-site `
+            -Files public/index.php,public/js/app.js `
+            -Server 'ftp://127.0.0.1:2121' -User ci -RemoteRoot / `
+            -LogPath D:\ci-deploy.log
+          $rc = $LASTEXITCODE
+          Get-Content D:\ci-deploy.log
+          if ($rc -ne 0) { Write-Host "deploy exited $rc"; exit 1 }
+          foreach ($pair in @(@('D:\ci-site\public\index.php','D:\ftp-root\public\index.php'),
+                              @('D:\ci-site\public\js\app.js','D:\ftp-root\public\js\app.js'))) {
+            $a = (Get-Item $pair[0]).Length
+            $b = (Get-Item $pair[1]).Length
+            Write-Host ("size {0}: local {1} remote {2}" -f $pair[1], $a, $b)
+            if ($a -ne $b) { exit 1 }
+          }
+          if (-not (Select-String -Path D:\ci-deploy.log -Pattern 'verified' -Quiet)) {
+            Write-Host 'log has no "verified" line'; exit 1
+          }
+
+      - name: Second run must be idempotent
+        shell: powershell
+        run: |
+          $env:FTP_PASS = 'cipass'
+          & powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1 `
+            -LocalRoot D:\ci-site `
+            -Files public/index.php,public/js/app.js `
+            -Server 'ftp://127.0.0.1:2121' -User ci -RemoteRoot / `
+            -LogPath D:\ci-deploy-2.log
+          if ($LASTEXITCODE -ne 0) { Get-Content D:\ci-deploy-2.log; exit 1 }
+          Write-Host 'second run ok'
+
+      - name: Delete and dry-run paths
+        shell: powershell
+        run: |
+          $env:FTP_PASS = 'cipass'
+          & powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1 `
+            -LocalRoot D:\ci-site -Files public/index.php `
+            -Server 'ftp://127.0.0.1:2121' -User ci -RemoteRoot / `
+            -Delete public/remove-me.txt -LogPath D:\ci-deploy-3.log
+          if ($LASTEXITCODE -ne 0) { Get-Content D:\ci-deploy-3.log; exit 1 }
+          Get-Content D:\ci-deploy-3.log
+          if (Test-Path D:\ftp-root\public\remove-me.txt) { Write-Host 'delete did not happen'; exit 1 }
+          Write-Host 'delete ok'
+
+          & powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1 `
+            -LocalRoot D:\ci-site -Files public/index.php `
+            -Server 'ftp://127.0.0.1:2121' -User ci -DryRun -LogPath D:\ci-dry.log
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-Content D:\ci-dry.log
+          if (-not (Select-String -Path D:\ci-dry.log -Pattern 'would upload' -Quiet)) { exit 1 }
+          Write-Host 'dry run ok'
+
+      - name: Missing local file must exit 3
+        shell: powershell
+        run: |
+          $env:FTP_PASS = 'cipass'
+          & powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy.ps1 `
+            -LocalRoot D:\ci-site -Files public/nope.php `
+            -Server 'ftp://127.0.0.1:2121' -User ci -LogPath D:\ci-missing.log
+          $rc = $LASTEXITCODE
+          Get-Content D:\ci-missing.log
+          if ($rc -ne 3) { Write-Host "expected exit 3, got $rc"; exit 1 }
+          Write-Host 'missing-file exit code ok'
+
+      - name: Stop the FTP server
+        if: always()
+        shell: powershell
+        run: |
+          if (Test-Path D:\ftp.pid) {
+            $ftpPid = Get-Content D:\ftp.pid
+            Stop-Process -Id $ftpPid -Force -ErrorAction SilentlyContinue
+          }
