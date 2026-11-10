@@ -1,0 +1,21 @@
+# secrets & local state
+.env
+.env.*
+*.secret
+*.pem
+*.key
+
+# deploy artifacts
+*.log
+ftp-deploy-*.txt
+*.publishproj
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/
+
+# powershell
+*.ps1.bak
