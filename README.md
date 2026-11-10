@@ -1,5 +1,7 @@
 # ftp-site-deploy
 
+[![ci](https://github.com/x18967890089-cell/ftp-site-deploy/actions/workflows/ci.yml/badge.svg)](https://github.com/x18967890089-cell/ftp-site-deploy/actions/workflows/ci.yml)
+
 On a shared PHP host you get FTP and nothing else: no SSH, no CI, no atomic release.
 This repository is the deploy path that survived that reality — a small PowerShell
 script that uploads an explicit file list, verifies every remote byte count, and
@@ -26,6 +28,18 @@ Local checkout ──(curl -T, one file at a time)──▶ FTP server ──▶
 | Check | Optionally probes URLs and prints HTTP status after the deploy. |
 | Result | `exit 0` only if every file uploaded and verified; `exit 4` otherwise. |
 
+## Tested against a real FTP server, not a mock
+
+Two jobs run on `windows-latest` for every push:
+
+| Job | What actually happens |
+| --- | --- |
+| `static` | The script is parsed by Windows PowerShell 5.1's own parser (0 errors), every byte is checked to be ASCII (a non-ASCII byte is what breaks quoting when a no-BOM file is read as ANSI), and PSScriptAnalyzer runs with `-Severity Error`. |
+| `e2e` | A throwaway `pyftpdlib` server is started on port 2121, then the script really uploads two files: exit `0`, both remote byte counts match, the log contains `verified`, a second run is still idempotent, `-Delete` removes the target (`226`), `-DryRun` prints `would upload`, and a missing local file exits `3`. |
+
+That is the whole point of the repository: the failure modes are the product, so they are
+reproduced in CI instead of described in prose.
+
 ## Quick start
 
 ```powershell
@@ -33,6 +47,9 @@ Local checkout ──(curl -T, one file at a time)──▶ FTP server ──▶
 .\deploy.ps1 -LocalRoot D:\sites\myapp `
              -Files public/index.php,public/js/app.js `
              -Server ftp://ftp.example.com:21 -User me -DryRun
+
+# `-Files` accepts a comma list either way: -Files a.php,b.php  or  -Files 'a.php,b.php'
+# (the quoted form is what survives "powershell -File deploy.ps1 ..." from a scheduler)
 
 # 2. deploy (secret via environment, never in the file)
 $env:FTP_PASS = '***'

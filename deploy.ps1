@@ -57,6 +57,17 @@ if (-not $User) { throw 'Missing -User (or set env FTP_USER).' }
 $pass = $env:FTP_PASS
 if (-not $pass) { throw 'Set env FTP_PASS before running (keeps the secret out of files and history).' }
 
+# Accept both "-Files a.php,b.php" and "-Files a.php b.php".
+# With "powershell -File deploy.ps1 ... -Files a,b" the comma list arrives as ONE string,
+# so each element is split again; it also means a single quoted list works everywhere.
+function Split-PathList([string[]]$Items) {
+    return @($Items | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+$Files = Split-PathList $Files
+$Delete = Split-PathList $Delete
+$Check = Split-PathList $Check
+if ($Files.Count -eq 0) { throw 'Missing -Files (comma list or one path per line in a file).' }
+
 $LocalRoot = (Resolve-Path $LocalRoot).Path.TrimEnd('\', '/')
 if (-not $LogPath) { $LogPath = Join-Path $env:TEMP ('ftp-deploy-' + (Get-Date -Format 'yyyyMMdd-HHmm') + '.log') }
 
